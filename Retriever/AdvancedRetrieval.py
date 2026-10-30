@@ -1,4 +1,6 @@
-from typing import List
+import asyncio
+import nest_asyncio
+from typing import List, Set
 from langchain_core.documents import Document
 from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
@@ -43,20 +45,20 @@ class AdvancedRetriever:
         print(f"Loading Cross-Encoder Reranker: {reranker_model_name}...")
         self.reranker = CrossEncoder(reranker_model_name)
 
-    def retrieve_and_rerank(
+    async def retrieve_and_rerank_async(
         self, queries: List[str], top_n: int = 5
     ) -> List[Document]:
-        """Retrieves candidates across all query variations using Hybrid Search,
+        """Asynchronously runs Hybrid Ensemble search across all queries concurrently using asyncio.gather()."""
+        # Step A: Fire all ensemble searches in parallel via ainvoke
+        tasks = [self.ensemble_retriever.ainvoke(f"query: {q}") for q in queries]
+        nested_results = await asyncio.gather(*tasks)
 
-        deduplicates them, and scores them using Cross-Encoder Reranking.
-        """
-        # Step A: Execute Hybrid Retrieval across generated multi-queries
+        # Step B: Deduplicate retrieved documents across query results
         candidate_docs: List[Document] = []
-        seen_contents = set()
+        seen_contents: Set[str] = set()
 
-        for q in queries:
-            docs = self.ensemble_retriever.invoke(f"query: {q}")
-            for doc in docs:
+        for doc_list in nested_results:
+            for doc in doc_list:
                 if doc.page_content not in seen_contents:
                     seen_contents.add(doc.page_content)
                     candidate_docs.append(doc)
@@ -64,18 +66,38 @@ class AdvancedRetriever:
         if not candidate_docs:
             return []
 
-        # Step B: Prepare Query-Document pairs for Cross-Encoder
-        # The primary (rewritten) query is used for precise scoring
+        # Step C: Prepare Query-Document pairs for Cross-Encoder
         primary_query = queries[0]
         pairs = [[primary_query, doc.page_content] for doc in candidate_docs]
 
-        # Step C: Compute relevance scores using Cross-Encoder
+        # Step D: Compute relevance scores using Cross-Encoder
         scores = self.reranker.predict(pairs)
 
-        # Step D: Pair documents with scores and sort descending
+        # Step E: Pair documents with scores and sort descending
         doc_score_pairs = list(zip(candidate_docs, scores))
         doc_score_pairs.sort(key=lambda x: x[1], reverse=True)
 
-        # Step E: Slice top_n highest-ranked documents
+        # Step F: Slice top_n highest-ranked documents
         reranked_docs = [doc for doc, score in doc_score_pairs[:top_n]]
         return reranked_docs
+
+    def retrieve_and_rerank(
+        self, queries: List[str], top_n: int = 5
+    ) -> List[Document]:
+        """Synchronous wrapper to safely invoke async retrieval inside Streamlit."""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If an event loop is already active in this thread
+                
+                nest_asyncio.apply()
+                return loop.run_until_complete(self.retrieve_and_rerank_async(queries, top_n))
+            else:
+                return loop.run_until_complete(self.retrieve_and_rerank_async(queries, top_n))
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(self.retrieve_and_rerank_async(queries, top_n))
+            finally:
+                loop.close()

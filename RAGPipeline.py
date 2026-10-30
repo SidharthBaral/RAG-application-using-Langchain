@@ -1,6 +1,6 @@
 import sys
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Iterator, Tuple
 from langchain_core.documents import Document
 
 # Ensure project root is in sys.path
@@ -14,11 +14,13 @@ from Retriever.PreRetrieval import PreRetrievalPipeline
 from Retriever.AdvancedRetrieval import AdvancedRetriever
 from Retriever.PostRetrieval import ContextualCompressor
 from Augmentation_Generation.Augmentation import AugmentationPipeline
-from Augmentation_Generation.CitationGenerator import GenerationPipeline
+from Augmentation_Generation.Generator import GenerationPipeline, CitationReference
 
 
 class Pipeline:
-    """End-to-End Query Execution Pipeline binding all runtime stages of the Advanced RAG system."""
+    """End-to-End Query Execution Pipeline binding all runtime stages of the Advanced RAG system.
+    Supports both full-pass execution (.run()) and real-time streaming (.prepare_context() + .stream_answer()).
+    """
 
     def __init__(
         self,
@@ -42,10 +44,11 @@ class Pipeline:
         self.enable_pre_retrieval = enable_pre_retrieval
         self.enable_compression = enable_compression
 
-        # Initialize Query Pipeline Sub-components
-        self.guardrails = RAGGuardrails(llm=self.llm)
+        # Consolidated single-call PreRetrieval + Input Guardrail
         self.pre_retriever = PreRetrievalPipeline(llm=self.llm)
+        self.guardrails = RAGGuardrails(llm=self.llm)
         
+        # Async-capable Hybrid Retriever
         self.advanced_retriever = AdvancedRetriever(
             vector_db=self.vector_db,
             documents=self.indexed_documents,
@@ -59,49 +62,44 @@ class Pipeline:
         self.generator = GenerationPipeline(llm=self.llm)
         self.top_n_rerank = top_n_rerank
 
+    # =========================================================================
+    # OPTION A: ONE-SHOT EXECUTION (Matches your original code exactly)
+    # =========================================================================
     def run(self, raw_query: str) -> Dict[str, Any]:
-        """Executes the complete query-time RAG workflow."""
+        """Executes the complete query-time RAG workflow synchronously."""
         pipeline_log = {}
 
-        # ----------------------------------------------------
-        # STAGE 1: INPUT GUARDRAIL
-        # ----------------------------------------------------
-        if self.enable_input_guardrail:
-            input_check = self.guardrails.validate_input(raw_query)
-            pipeline_log["input_guardrail"] = input_check
-            if not input_check.is_safe:
+        # STAGES 1 & 2: CONSOLIDATED GUARDRAIL + PRE-RETRIEVAL (1 LLM CALL)
+        if self.enable_pre_retrieval:
+            pre_result = self.pre_retriever.run(query=raw_query)
+            pipeline_log["pre_retrieval"] = pre_result
+            pipeline_log["input_guardrail"] = getattr(pre_result, "safety", None)
+
+            if self.enable_input_guardrail and hasattr(pre_result, "safety") and not pre_result.safety.is_safe:
                 return {
                     "success": False,
                     "error_stage": "Input Guardrail",
-                    "answer": f"❌ Query rejected: {input_check.reason}",
+                    "answer": f"❌ Query rejected: {pre_result.safety.reason}",
                     "citations": [],
                     "logs": pipeline_log,
                 }
 
-        # ----------------------------------------------------
-        # STAGE 2: PRE-RETRIEVAL (Rewriting & Multi-Query Expansion)
-        # ----------------------------------------------------
-        if self.enable_pre_retrieval:
-            pre_result = self.pre_retriever.run(query=raw_query)
+            search_query = pre_result.rewritten_query
             queries_to_search = [pre_result.rewritten_query] + pre_result.multi_queries
-            pipeline_log["pre_retrieval"] = pre_result
         else:
+            search_query = raw_query
             queries_to_search = [raw_query]
             pipeline_log["pre_retrieval"] = None
+            pipeline_log["input_guardrail"] = None
 
-        # ----------------------------------------------------
-        # STAGE 3: ADVANCED HYBRID RETRIEVAL & CROSS-ENCODER RERANKING
-        # ----------------------------------------------------
+        # STAGE 3: ASYNC PARALLEL HYBRID RETRIEVAL & CROSS-ENCODER RERANKING
         reranked_docs = self.advanced_retriever.retrieve_and_rerank(
             queries=queries_to_search, 
             top_n=self.top_n_rerank
         )
         pipeline_log["retrieved_documents"] = reranked_docs
 
-        # ----------------------------------------------------
         # STAGE 4: POST-RETRIEVAL CONTEXTUAL COMPRESSION
-        # ----------------------------------------------------
-        search_query = queries_to_search[0]
         if self.enable_compression and reranked_docs:
             compressed_docs = self.compressor.compress_documents(
                 query=search_query, 
@@ -109,29 +107,22 @@ class Pipeline:
             )
         else:
             compressed_docs = reranked_docs
-
         pipeline_log["compressed_documents"] = compressed_docs
 
-        # ----------------------------------------------------
-        # STAGE 5: AUGMENTATION (Context Optimization & Payload Assembly)
-        # ----------------------------------------------------
+        # STAGE 5: AUGMENTATION
         augmented_payload = self.augmentor.augment(
             query=search_query, 
             documents=compressed_docs
         )
         pipeline_log["augmented_payload"] = augmented_payload
 
-        # ----------------------------------------------------
-        # STAGE 6: GROUNDED GENERATION WITH CITATIONS
-        # ----------------------------------------------------
+        # STAGE 6: GROUNDED GENERATION WITH STRUCTURED CITATIONS
         gen_response = self.generator.generate(augmented_payload)
         pipeline_log["generation"] = gen_response
 
-        # ----------------------------------------------------
         # STAGE 7: OUTPUT GUARDRAIL (Faithfulness Audit)
-        # ----------------------------------------------------
         final_answer = gen_response.answer
-        if self.enable_output_guardrail and augmented_payload["formatted_context"]:
+        if self.enable_output_guardrail and augmented_payload.get("formatted_context"):
             output_check = self.guardrails.validate_output(
                 context=augmented_payload["formatted_context"],
                 answer=gen_response.answer,
@@ -150,3 +141,59 @@ class Pipeline:
             "citations": gen_response.citations,
             "logs": pipeline_log,
         }
+
+    # =========================================================================
+    # OPTION B: STREAMING EXECUTION (For st.write_stream in Streamlit)
+    # =========================================================================
+    def prepare_context(self, raw_query: str) -> Tuple[bool, Dict[str, Any], Dict[str, Any]]:
+        """Executes Stages 1 through 5 up to context augmentation without generating text yet."""
+        pipeline_log = {}
+
+        if self.enable_pre_retrieval:
+            pre_result = self.pre_retriever.run(query=raw_query)
+            pipeline_log["pre_retrieval"] = pre_result
+            pipeline_log["input_guardrail"] = getattr(pre_result, "safety", None)
+
+            if self.enable_input_guardrail and hasattr(pre_result, "safety") and not pre_result.safety.is_safe:
+                return False, {"error": f"❌ Query rejected: {pre_result.safety.reason}"}, pipeline_log
+
+            search_query = pre_result.rewritten_query
+            queries_to_search = [pre_result.rewritten_query] + pre_result.multi_queries
+        else:
+            search_query = raw_query
+            queries_to_search = [raw_query]
+            pipeline_log["pre_retrieval"] = None
+            pipeline_log["input_guardrail"] = None
+
+        reranked_docs = self.advanced_retriever.retrieve_and_rerank(
+            queries=queries_to_search, 
+            top_n=self.top_n_rerank
+        )
+        pipeline_log["retrieved_documents"] = reranked_docs
+
+        if self.enable_compression and reranked_docs:
+            compressed_docs = self.compressor.compress_documents(
+                query=search_query, 
+                documents=reranked_docs
+            )
+        else:
+            compressed_docs = reranked_docs
+        pipeline_log["compressed_documents"] = compressed_docs
+
+        augmented_payload = self.augmentor.augment(
+            query=search_query, 
+            documents=compressed_docs
+        )
+        pipeline_log["augmented_payload"] = augmented_payload
+
+        return True, augmented_payload, pipeline_log
+
+    def stream_answer(self, augmented_payload: Dict[str, Any]) -> Iterator[str]:
+        """Yields streaming tokens for real-time rendering."""
+        return self.generator.stream_generate(augmented_payload)
+
+    def audit_output(self, context: str, answer: str):
+        """Audits generated streamed text for factual grounding."""
+        if not self.enable_output_guardrail or not context:
+            return None
+        return self.guardrails.validate_output(context=context, answer=answer)

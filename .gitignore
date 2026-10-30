@@ -1,0 +1,21 @@
+# Environment & Secrets
+.env
+*.env
+
+# Python Virtual Environment
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Vector Database Local Storage
+my_chroma_data/
+.chroma/
+
+# IDE Settings
+.vscode/
+.idea/
+
+# OS Files
+.DS_Store
+Thumbs.db
