@@ -3,13 +3,13 @@ import re
 import streamlit as st
 from dotenv import load_dotenv
 
-from Models.ResponseGeneration import TextGeneration
-from Models.EmbeddingModel import MultilingualEmbeddingGenerator
-from Indexing.data_extraction.DataExtractorFactory import DataExtractorFactory
-from Indexing.preprocessor.TextPreprocessor import TextPreprocessor
-from Indexing.preprocessor.VectorDB import VectorDB
-from RAGPipeline import Pipeline
-from Memory.SQLiteMemory import SQLiteChatMemory
+from src.Models.ResponseGeneration import TextGeneration
+from src.Indexing.data_extraction.DataExtractorFactory import DataExtractorFactory
+from src.Models.EmbeddingModel import MultilingualEmbeddingGenerator
+from src.Indexing.preprocessor.TextPreprocessor import TextPreprocessor
+from src.Indexing.preprocessor.VectorDB import VectorDB
+from src.RAGPipeline import Pipeline
+from src.Memory.SQLiteMemory import SQLiteChatMemory
 
 load_dotenv()
 
