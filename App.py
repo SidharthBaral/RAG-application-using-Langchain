@@ -9,6 +9,7 @@ from Indexing.data_extraction.DataExtractorFactory import DataExtractorFactory
 from Indexing.preprocessor.TextPreprocessor import TextPreprocessor
 from Indexing.preprocessor.VectorDB import VectorDB
 from RAGPipeline import Pipeline
+from Memory.SQLiteMemory import SQLiteChatMemory
 
 load_dotenv()
 
@@ -70,6 +71,7 @@ with st.sidebar.expander("🛠 Retrieval & Guardrails", expanded=False):
     enable_input_guardrail = st.checkbox("Enable Input Guardrail", value=True)
     enable_output_guardrail = st.checkbox("Enable Output Guardrail", value=True)
     enable_pre_retrieval = st.checkbox("Enable Pre-Retrieval (Rewriting)", value=True)
+    history_window = st.slider("Conversation Memory Window (Turns)", min_value=2, max_value=12, value=6, step=2)
     enable_compression = st.checkbox("Enable Contextual Compression", value=True)
     enable_lost_in_middle = st.checkbox("Enable Lost-In-The-Middle Reordering", value=True)
     top_n_rerank = st.slider("Top-N Reranked Documents", min_value=1, max_value=10, value=4)
@@ -115,6 +117,7 @@ try:
         collection_name=collection_name,
         persist_directory="./my_chroma_data",
     )
+    chat_memory = SQLiteChatMemory(db_path="conversations.db")
 except Exception as e:
     st.error(f"Initialization Error: {str(e)}")
     st.stop()
@@ -165,14 +168,41 @@ with tab1:
                 st.error(f"Ingestion Failed: {str(e)}")
 
 # ------------------------------------------------------------------------------
-# TAB 2: RAG Q&A INTERFACE
+# TAB 2: RAG Q&A INTERFACE (Multi-Turn Chat with SQLite Memory)
 # ------------------------------------------------------------------------------
 with tab2:
     st.subheader("Ask Questions Against Your Knowledge Base")
 
+    # --- Session Controls ---
+    col_session, col_clear = st.columns([3, 1])
+    with col_session:
+        if "session_id" not in st.session_state:
+            st.session_state["session_id"] = "user_session_1"
+        session_id = st.text_input(
+            "Active Conversation Session ID:",
+            value=st.session_state["session_id"],
+            help="Switch sessions or enter a new ID to start an isolated conversation thread.",
+        )
+        st.session_state["session_id"] = session_id
+    with col_clear:
+        st.write("")
+        st.write("")
+        if st.button("🗑️ Clear Session History", use_container_width=True):
+            chat_memory.clear_session(session_id)
+            st.success(f"History cleared for session: '{session_id}'")
+            st.rerun()
+
+    # --- Render Past Messages from SQLite ---
+    past_messages = chat_memory.get_messages(session_id=session_id, limit=10)
+    if past_messages:
+        with st.expander(f"📜 Session History ({len(past_messages)} messages)", expanded=False):
+            for msg in past_messages:
+                role_icon = "🧑‍💻" if msg["role"] == "user" else "🤖"
+                st.markdown(f"**{role_icon} {msg['role'].title()}:** {msg['message']}")
+
     user_query = st.text_input(
-        "Enter your question:",
-        placeholder="What did he say about building agents from scratch?",
+        "Enter your question or follow-up:",
+        placeholder="e.g., 'What is an AI agent?' followed by 'How do I build one?'",
     )
 
     if st.button("Search & Generate Answer", type="primary", use_container_width=True):
@@ -181,11 +211,12 @@ with tab2:
         elif "indexed_documents" not in st.session_state:
             st.warning("Please index a document in the 'Document Ingestion' tab first before searching.")
         else:
-            # 1. Instantiate Pipeline
+            # 1. Instantiate Pipeline with Memory Parameters
             pipeline = Pipeline(
                 llm=active_llm,
                 vector_db=vector_db,
                 indexed_documents=st.session_state["indexed_documents"],
+                history_window=history_window,
                 enable_input_guardrail=enable_input_guardrail,
                 enable_output_guardrail=enable_output_guardrail,
                 enable_pre_retrieval=enable_pre_retrieval,
@@ -203,25 +234,33 @@ with tab2:
             # BRANCH 1: LIVE TOKEN STREAMING
             # ==================================================================
             if enable_streaming:
-                # Run Stages 1 through 5 inside the spinner
-                with st.spinner("Analyzing query and searching documents concurrently..."):
-                    is_safe, payload, logs = pipeline.prepare_context(user_query)
+                with st.spinner("Analyzing query, resolving context & searching documents concurrently..."):
+                    is_safe, payload, logs = pipeline.prepare_context(
+                        raw_query=user_query, session_id=session_id
+                    )
 
                 if not is_safe:
                     st.error(payload.get("error", "Query rejected by Input Guardrail."))
                 else:
                     st.markdown("### 📝 Grounded Response")
                     
-                    # Real-time token streaming (First token renders in ~0.3-0.5s)
+                    # Real-time token streaming
                     stream_generator = pipeline.stream_answer(payload)
                     final_answer = st.write_stream(stream_generator)
+
+                    # Persist turn to SQLite
+                    pipeline.save_turn(
+                        session_id=session_id,
+                        user_query=user_query,
+                        assistant_answer=final_answer,
+                    )
 
                     # Stage 7: Post-Stream Faithfulness Audit
                     if enable_output_guardrail and payload.get("formatted_context"):
                         with st.spinner("Verifying factual accuracy..."):
                             output_check = pipeline.audit_output(
                                 context=payload["formatted_context"],
-                                answer=final_answer
+                                answer=final_answer,
                             )
                         if output_check:
                             logs["output_guardrail"] = output_check
@@ -248,11 +287,11 @@ with tab2:
                                 })
 
             # ==================================================================
-            # BRANCH 2: SYNCHRONOUS FULL-PASS EXECUTION (Original Behavior)
+            # BRANCH 2: SYNCHRONOUS FULL-PASS EXECUTION (.run automatically saves turn)
             # ==================================================================
             else:
                 with st.spinner("Executing End-to-End RAG Pipeline..."):
-                    result = pipeline.run(user_query)
+                    result = pipeline.run(raw_query=user_query, session_id=session_id)
 
                 st.markdown("### 📝 Grounded Response")
                 if not result.get("success", False):
@@ -282,6 +321,11 @@ with tab2:
             st.markdown("---")
             st.markdown("### 🔍 Pipeline Execution Details")
 
+            # Stage 0: Conversational Memory Context
+            if logs.get("retrieved_history"):
+                with st.expander("📜 Stage 0: Conversational Memory Context (From SQLite)"):
+                    st.text(logs["retrieved_history"])
+
             # Stage 1: Input Guardrail Log
             if logs.get("input_guardrail"):
                 with st.expander("🛡 Stage 1: Input Guardrail Evaluation"):
@@ -291,11 +335,11 @@ with tab2:
                     st.write(f"**Status:** {'Safe ✅' if is_safe_val else 'Unsafe ❌'}")
                     st.write(f"**Reason:** {reason_val}")
 
-            # Stage 2: Pre-Retrieval Log
+            # Stage 2: History-Aware Pre-Retrieval Log
             if logs.get("pre_retrieval"):
-                with st.expander("🧠 Stage 2: Pre-Retrieval Rewriting & Multi-Queries"):
+                with st.expander("🧠 Stage 2: History-Aware Query Condensation & Multi-Queries"):
                     pr = logs["pre_retrieval"]
-                    st.write(f"**Rewritten Query:** {pr.rewritten_query}")
+                    st.write(f"**Rewritten / Standalone Query:** `{pr.rewritten_query}`")
                     st.write(f"**Multi-Queries:** {pr.multi_queries}")
                     st.write(f"**Domain Route:** {pr.domain_route}")
 

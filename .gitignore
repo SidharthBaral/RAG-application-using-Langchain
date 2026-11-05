@@ -12,6 +12,9 @@ __pycache__/
 my_chroma_data/
 .chroma/
 
+# SQLite Database
+conversations.db
+
 # IDE Settings
 .vscode/
 .idea/
